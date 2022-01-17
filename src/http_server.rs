@@ -1,19 +1,20 @@
 use std::{
     io::{BufRead, BufReader, BufWriter, Read, Write},
     net::{TcpListener, TcpStream},
-    vec,
+    sync::Arc,
+    thread, vec,
 };
 
 use crate::*;
 
+pub struct HttpServer {
+    routes: Vec<RouteHandler>,
+}
+
 struct RouteHandler {
     path: String,
     method: String,
-    handler: Box<dyn FnMut(&Request) -> Response>,
-}
-
-pub struct HttpServer {
-    routes: Vec<RouteHandler>,
+    handler: Box<dyn Fn(&Request) -> Response + Send + Sync>,
 }
 
 impl HttpServer {
@@ -21,7 +22,11 @@ impl HttpServer {
         HttpServer { routes: vec![] }
     }
 
-    pub fn get(&mut self, path: &str, handler: impl FnMut(&Request) -> Response + 'static) {
+    pub fn get(
+        &mut self,
+        path: &str,
+        handler: impl Fn(&Request) -> Response + Send + Sync + 'static,
+    ) {
         self.routes.push(RouteHandler {
             path: path.to_owned(),
             method: "GET".to_owned(),
@@ -29,7 +34,11 @@ impl HttpServer {
         });
     }
 
-    pub fn post(&mut self, path: &str, handler: impl FnMut(&Request) -> Response + 'static) {
+    pub fn post(
+        &mut self,
+        path: &str,
+        handler: impl Fn(&Request) -> Response + Send + Sync + 'static,
+    ) {
         self.routes.push(RouteHandler {
             path: path.to_owned(),
             method: "POST".to_owned(),
@@ -37,31 +46,35 @@ impl HttpServer {
         });
     }
 
-    pub fn serve(&mut self) {
+    pub fn serve(self) {
         let listener = TcpListener::bind("127.0.0.1:3000").expect("could not bind to port 3000");
+        let arc = Arc::new(self);
 
-        'connection: for stream in listener.incoming() {
-            match stream {
-                Ok(mut stream) => {
-                    let request = parse_request_header(&stream);
+        for stream in listener.incoming() {
+            let server = arc.clone();
+            thread::spawn(move || server.handle_request(stream));
+        }
+    }
 
-                    for route in self.routes.iter_mut() {
-                        if request.uri == route.path && request.method == route.method {
-                            let response = (*route.handler)(&request);
+    fn handle_request(&self, stream: Result<TcpStream, std::io::Error>) {
+        match stream {
+            Ok(mut stream) => {
+                let request = parse_request_header(&stream);
 
-                            send_response(&mut stream, response).expect("error sending response");
-                            continue 'connection;
-                        }
+                for route in self.routes.iter() {
+                    if request.uri == route.path && request.method == route.method {
+                        let response = (*route.handler)(&request);
+                        send_response(&mut stream, response).expect("error sending response");
+                        return;
                     }
+                }
 
-                    stream
-                        .write("HTTP/1.1 404 Not Found\n\n".as_bytes())
-                        .expect("error sending 404");
-                }
-                Err(err) => {
-                    println!("{:?}", err);
-                    continue;
-                }
+                stream
+                    .write("HTTP/1.1 404 Not Found\n\n".as_bytes())
+                    .expect("error sending 404");
+            }
+            Err(err) => {
+                println!("{:?}", err);
             }
         }
     }
